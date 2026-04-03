@@ -1,15 +1,9 @@
 ---
 name: openscad
 description: >
-  Programmatic 3D CAD with OpenSCAD. Generate .scad files, render to STL for 3D printing,
-  preview as PNG, iterate designs with AI vision feedback, and manage parametric models.
-  Use when user asks to "design a 3D model", "create an STL", "make a 3D printable part",
-  "openscad", "parametric design", "3D print", "CAD model", "render 3D", "generate STL",
-  "design an enclosure", "make a box", "create a bracket", or any 3D modeling task.
-  Also triggers on "refine the model", "adjust dimensions", "preview the design",
-  "export for printing", "multi-view preview", "check printability", "replicate this object",
-  "reproduce from image", "recreate this part", "model this from photo", "reverse engineer",
-  "convert STL to SCAD", "reconstruct from STL", "make this STL parametric", or "STL to OpenSCAD".
+  Programmatic 3D CAD with OpenSCAD. Generate .scad files, render STL for 3D printing,
+  preview as PNG with AI vision feedback. Triggers on: 3D model, STL, 3D print, parametric
+  design, openscad, CAD, enclosure, bracket, or any 3D modeling task.
 argument-hint: "<description of object to design or path to existing .scad file>"
 allowed-tools: "Bash(*),Read,Edit,Write,Glob,Grep,Agent"
 metadata:
@@ -284,23 +278,55 @@ STL files are triangle meshes with no semantic information about the original pr
 
 **Rule 3: Bounding box match ≠ correct model.** 0.000mm bbox delta can mean only 70% geometric accuracy. Always use mesh comparison (`openscad-stl-compare.sh`) with boolean diff images.
 
-**Rule 4: Choose the right approach for the geometry type:**
+**Rule 4: ANALYZE FIRST, DECOMPOSE, THEN CHOOSE per-component approach.**
+Do NOT jump to code. The analysis phase must answer these questions:
+1. **What are the dominant features?** (diagonal arm, clips, channels, holes)
+2. **What is the thinnest axis?** That's the likely extrusion direction — NOT necessarily the stability score winner
+3. **Can the object be decomposed into simpler sub-objects?** Model each with its best technique
+4. **Where are internal channels/gaps?** Slice along Z to find multi-body cross-sections
+
+**Rule 5: Choose the extrusion axis by geometry, not just stability score.**
+
+The profile extractor's stability score finds the axis with the most uniform cross-section. But this is misleading for models with diagonal features — slicing along Z for a diagonal bracket produces staircase artifacts. Instead:
+
+| Model Type | Best Extrusion Axis | Why |
+|-----------|-------------------|-----|
+| Flat bracket/plate | Thinnest axis (smallest extent) | Profile in the wide plane captures all detail |
+| Diagonal/angled arm | Thinnest axis | Diagonals live in the plane of the two longest axes |
+| Clean extrusion (stability < 0.1) | Stability-score axis | Profiles are identical → stability is reliable |
+| Cylindrical (stability > 0.3) | Object's rotational axis | Use rotate_extrude or parametric primitives |
+| Truly complex (no good axis) | Dense multi-axis slabbing | 2mm slabs along thinnest axis |
+
+```bash
+# Always run ALL analysis tools before writing any code:
+bash ~/.claude/skills/openscad/scripts/openscad-stl-reconstruct.sh model.stl analysis/
+python3 ~/.claude/skills/openscad/scripts/openscad-profile-extract.py model.stl --json analysis/profile.json
+python3 ~/.claude/skills/openscad/scripts/openscad-adaptive-slice.py model.stl analysis/
+```
+
+After analysis, compare: **thinnest axis extent** vs **stability-score axis**. If they differ, the thinnest axis is usually better for models with angled features.
+
+**Rule 6: Choose the right technique for each component:**
 
 | Geometry | Best Approach | Expected Accuracy |
 |----------|--------------|-------------------|
 | Flat/angular (brackets, plates) | Profile extraction + linear_extrude | 90-96% |
+| Diagonal features (angled arms, tapers) | Profile along thinnest axis + linear_extrude | 85-92% |
 | Simple known shapes (stadium, box) | Parametric primitives + SDF optimizer | 90-96% |
 | Cylindrical features (puzzle tabs, bosses) | Parametric circle() + square() | 85-95% |
+| Smooth transitions (convex shapes only) | hull() between boundary profiles | 85-90% |
+| Multi-width models (width varies along axis) | Dense X-slab (2mm profiles along thinnest axis) | ~92% |
 | Mixed (curves + flats) | Polygon profile (hi-res, tol=0.02) | 70-80% |
 | Complex organic shapes | import() original STL + parametric modifications | N/A |
 
-**Rule 5: Profile-extract FIRST, then decide approach.**
-```bash
-# Always run both tools before writing any code:
-bash ~/.claude/skills/openscad/scripts/openscad-stl-reconstruct.sh model.stl analysis/
-python3 ~/.claude/skills/openscad/scripts/openscad-profile-extract.py model.stl --json analysis/profile.json
-```
-The profile extractor's stability score tells you which axis to extrude along. The SVG contour analysis tells you the internal structure. Together they determine the approach.
+**Rule 7: hull() ONLY for convex profiles.** Hull between two profiles creates the convex hull — it fills in ALL concavities (channels, clips, U-forks, hooks). Only use hull for simple solid zones with 1 contour and no holes. For concave profiles, use linear_extrude of a representative profile instead.
+
+**Rule 8: Dense X-slab approach for complex models.**
+When no single extrusion works, slice every 2mm along the thinnest axis:
+1. At each X position, extract the full Y-Z cross-section (ALL bodies, not just the largest)
+2. Extrude each slab for 2mm width
+3. Union all slabs — gaps between bodies are naturally preserved
+4. Note: this approach has a ~6% volume overestimate floor from polygon extraction artifacts. Below 6% requires hand-modeled parametric geometry.
 
 **Use the automated reconstruction analysis FIRST — before writing any code:**
 ```bash
@@ -321,7 +347,7 @@ bash ~/.claude/skills/openscad/scripts/openscad-stl-compare.sh original.stl reco
 ```
 Target: >95% geometric accuracy. Use diff images to identify remaining discrepancies.
 
-### Step 1: Automated Analysis (run BOTH tools)
+### Step 1: Automated Analysis (run ALL tools)
 
 ```bash
 # Tool 1: SVG profiling + primitive detection
@@ -330,18 +356,41 @@ bash ~/.claude/skills/openscad/scripts/openscad-stl-reconstruct.sh model.stl ana
 # Tool 2: Profile extraction + extrusion axis detection
 python3 ~/.claude/skills/openscad/scripts/openscad-profile-extract.py model.stl \
     --output analysis/profile.scad --json analysis/profile.json
+
+# Tool 3: Adaptive multi-axis feature map
+python3 ~/.claude/skills/openscad/scripts/openscad-adaptive-slice.py model.stl analysis/
 ```
 
 **Key outputs to examine:**
 - `analysis/slices/*.svg` — 2D profiles at 5 Z levels
 - `analysis/profile.json` — extrusion axis, stability score, profile points, hole count
+- `analysis/adaptive-slicing.json` — feature zones on all 3 axes, transition locations
 - `analysis/primitives.json` — detected cylinders/planes
 - `analysis/mesh-info.json` — volume, dimensions, symmetry
 
-**Decision tree from the analysis:**
-1. If `stability_score < 0.1` → the shape is a clean extrusion. Use `profile.scad` directly with `linear_extrude()`
-2. If `stability_score < 0.3` → mostly extruded with variations. Extract profile + add features from SVG contour differences
-3. If `stability_score > 0.3` → complex shape. Use SVG slicing at 1mm intervals to map the full structure, then model with parametric primitives
+### Step 1b: Understand the Object (BEFORE writing code)
+
+After running analysis tools, render multi-angle previews and answer:
+
+1. **What are the main components?** (e.g. "bottom clip + diagonal arm + top clip")
+2. **Which axis is thinnest?** Compare extents — the thinnest is likely the extrusion direction
+3. **Are there diagonal/angled features?** If yes, the stability-score axis is probably WRONG
+4. **Where do cross-sections change?** Check the adaptive slicer's transition zones
+5. **Are there multi-body zones?** (channels, rails, gaps between parts)
+
+**Decision tree — axis selection:**
+1. If `stability_score < 0.1` AND thinnest axis matches stability axis → clean extrusion, use `profile.scad`
+2. If model has **diagonal features** → use the **thinnest axis** regardless of stability score
+3. If `stability_score < 0.3` AND no diagonals → stability axis + feature variations
+4. If `stability_score > 0.3` → complex shape. Try dense X-slab along thinnest axis, or decompose into sub-objects
+
+**Decision tree — technique per component:**
+- Simple extruded body → profile + linear_extrude along extrusion axis
+- Diagonal arm/strut → profile along thinnest axis captures it naturally
+- Clips, hooks, U-channels → profile extraction (NOT hull — hull fills concavities)
+- Cylindrical features → parametric circle() + square(), NOT polygon profiles
+- Smooth convex transitions → hull() between boundary profiles (ONLY if convex)
+- Complex multi-width → dense 2mm slabs along thinnest axis
 
 **For models with cylindrical features** (stability > 0.3 or SVG shows circular contours):
 - Do NOT rely on polygon profiles — they approximate curves poorly
@@ -360,6 +409,33 @@ bash ~/.claude/skills/openscad/scripts/openscad-render.sh preview /tmp/stl-viewe
 ```
 
 Read all preview images to understand the 3D shape from multiple angles.
+
+### Step 1b: Auto-Reconstruction (NEW — recommended for most models)
+
+After running the adaptive slicer, use the auto-reconstructor to generate parametric .scad directly:
+
+```bash
+# Option A: With pre-computed analysis
+python3 ~/.claude/skills/openscad/scripts/openscad-auto-reconstruct.py model.stl \
+    --analysis analysis/ --output project/src/main.scad
+
+# Option B: Run analysis + reconstruction in one step
+python3 ~/.claude/skills/openscad/scripts/openscad-auto-reconstruct.py model.stl \
+    --output project/src/main.scad --run-analysis
+
+# Option C: Tighter circle fitting for precision parts
+python3 ~/.claude/skills/openscad/scripts/openscad-auto-reconstruct.py model.stl \
+    --analysis analysis/ --output project/src/main.scad --circle-threshold 0.3
+```
+
+This automatically:
+1. Parses the feature map JSON into zones
+2. Extracts profiles at zone boundaries
+3. Fits circles/arcs to replace polygon approximations (Feature 3)
+4. Generates hull() blends for transition zones (Feature 2)
+5. Emits one OpenSCAD module per zone with sculptor assembly (Feature 1)
+
+The output is a good starting point — review and refine the generated .scad, then verify with mesh comparison. For models with cylindrical features, this typically achieves >85% accuracy automatically (vs 75% with polygon-only).
 
 ### Step 2: Detailed Structure Mapping
 
@@ -644,6 +720,7 @@ All scripts live in `~/.claude/skills/openscad/scripts/`:
 | `openscad-stl-reconstruct.sh` | Automated STL analysis: profiles, primitives, CSG inference |
 | `openscad-sdf-optimize.py` | SDF-based parameter optimizer (IoU scoring, no OpenSCAD in loop) |
 | `openscad-adaptive-slice.py` | Adaptive multi-axis slicing (coarse→transitions→fine on X,Y,Z) |
+| `openscad-auto-reconstruct.py` | Auto-translate feature map → parametric .scad (circle fitting, hull blending) |
 
 ### openscad-render.sh Commands
 
