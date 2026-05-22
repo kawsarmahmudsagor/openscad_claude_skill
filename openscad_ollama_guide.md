@@ -499,13 +499,16 @@ python3 openscad_ollama_harness.py --skill-path ~/my-skills/openscad
 
 # All options
 python3 openscad_ollama_harness.py \
-    --model qwen3-vl:235b-cloud \
+    --model gemma4:31b \
     --skill-path ~/.claude/skills/openscad \
     --max-iterations 50
 ```
 
-EXAMPLE: You: Replicate this object from the photo /home/sagor/Projects/openscad_claude_skill/images/ring_1.png
-You: Here is the reference image ~/Desktop/enclosure_reference.png, reproduce it in OpenSCAD
+EXAMPLE:
+You: Replicate this object from the photo /home/xr23/Projects/openscad_claude_skill/images/ring_1.png. 
+Write the OpenSCAD code, render it, analyse the preview against the reference, fix any 
+discrepancies, and repeat until the result closely matches the photo. 
+Do not stop between iterations — keep going until you are satisfied with the result.
 
 ### Example Session
 
