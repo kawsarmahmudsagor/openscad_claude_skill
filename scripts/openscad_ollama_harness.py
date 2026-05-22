@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 OpenSCAD Skill Harness for Ollama (qwen3-vl:235b-cloud)
 ========================================================
@@ -19,13 +20,18 @@ Fixes applied:
                call so the model sees the output without calling read_image
                itself, preventing blind retry loops.
   2025-05 (c): Fix 3 — detect repeated write_file calls to the same .scad path
-               without an intervening render. Forces a render after
-               WRITE_ESCALATE_THRESHOLD writes via a user-role message.
-  2025-05 (d): Fix 4 — block any identical bash command run 2+ times in a row
-               to prevent mkdir/init/other loops.
-  2025-05 (e): Fix 5 — syntax-check every .scad file immediately after
-               write_file using OpenSCAD's parser. Returns the error to the
-               model instantly so it fixes syntax before wasting a render call.
+               without an intervening render. After WRITE_WARN_THRESHOLD writes,
+               append a warning to the tool result. After WRITE_ESCALATE_THRESHOLD
+               writes, inject a user-role message forcing a render call. This
+               closes the blind rewrite loop where the model rewrites main.scad
+               indefinitely because it has no visual feedback.
+  2026-05 (d): Fix 4 — render-timestamp snapshot. The previews directory
+               accumulates timestamped PNGs across iterations. The previous
+               selector used isometric[0] which is alphabetical order, so it
+               kept picking the OLDEST file in the directory. Now we snapshot
+               time.time() immediately before invoking openscad-render.sh and
+               only consider PNGs modified at or after that snapshot. Among
+               those, isometric is preferred; otherwise newest wins.
 """
 
 import argparse
@@ -35,6 +41,7 @@ import json
 import os
 import subprocess
 import textwrap
+import time
 from pathlib import Path
 
 import ollama  # pip install ollama
@@ -50,14 +57,17 @@ DEFAULT_SKILL_PATH = Path.home() / ".claude" / "skills" / "openscad"
 SKILL_FILE         = "SKILL.md"
 
 # Write-loop guard (Fix 3)
-WRITE_WARN_THRESHOLD      = 1   # append warning after this many writes without render
-WRITE_ESCALATE_THRESHOLD  = 1   # inject user-role escalation after this many writes
+# After this many writes to the same file without a render, append a warning
+WRITE_WARN_THRESHOLD = 1
+# After this many writes, escalate to a forceful user-role message
+WRITE_ESCALATE_THRESHOLD = 1
 
-# Repeated bash command guard (Fix 4)
-BASH_REPEAT_THRESHOLD = 2       # block after this many identical consecutive calls
-
-# OpenSCAD binary (Fix 5)
-OPENSCAD_BIN = os.environ.get("OPENSCAD_BIN", "/usr/bin/openscad")
+# Render-snapshot guard (Fix 4)
+# Slack in seconds applied to the render snapshot timestamp so we don't miss
+# files whose mtime is a hair earlier than time.time() due to FS resolution
+# or clock skew. Generous enough to cover any reasonable jitter, tight enough
+# to never let in a previous-iteration file.
+RENDER_MTIME_SLACK = 2.0
 
 # Safety: commands that will never be executed
 BLOCKED_COMMANDS = [
@@ -253,11 +263,14 @@ TOOLS = [
 def tool_bash(command: str, working_dir: str = None) -> str:
     """Run a shell command safely, return stdout+stderr."""
 
+    # Safety check
     for blocked in BLOCKED_COMMANDS:
         if blocked in command:
             return f"[BLOCKED] Command contains forbidden pattern: '{blocked}'"
 
-    # Headless fix: wrap render calls with xvfb-run if not already wrapped.
+    # Headless fix: OpenSCAD preview needs OpenGL / a display.
+    # On servers or WSL without an X server, wrap render calls with xvfb-run
+    # (virtual framebuffer). No-op if already wrapped.
     if "openscad-render.sh" in command and "xvfb-run" not in command:
         command = f"xvfb-run -a {command}"
 
@@ -270,7 +283,7 @@ def tool_bash(command: str, working_dir: str = None) -> str:
             capture_output=True,
             text=True,
             cwd=working_dir or os.getcwd(),
-            timeout=300
+            timeout=300  # 5-minute timeout for long renders
         )
         output = result.stdout
         if result.stderr:
@@ -278,6 +291,7 @@ def tool_bash(command: str, working_dir: str = None) -> str:
         if result.returncode != 0:
             output += f"\n[exit code: {result.returncode}]"
 
+        # Truncate very long outputs
         if len(output) > MAX_TOOL_OUTPUT:
             output = output[:MAX_TOOL_OUTPUT] + f"\n... [truncated, {len(output)} total chars]"
 
@@ -391,71 +405,114 @@ def tool_grep(pattern: str, path: str, recursive: bool = True) -> str:
         return f"[ERROR] {e}"
 
 
-def syntax_check_scad(path: str) -> str | None:
-    """
-    Fix 5: Run OpenSCAD's parser on a .scad file without rendering.
-    Returns an error string if syntax is invalid, None if valid.
-    Uses --export-format echo which only parses, never renders.
-    """
-    try:
-        result = subprocess.run(
-            f"xvfb-run -a {OPENSCAD_BIN} -o /dev/null --export-format echo {path}",
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        combined = (result.stdout + result.stderr).strip()
-        if result.returncode != 0:
-            # Extract the most useful lines (parser errors, not render stats)
-            error_lines = [
-                l for l in combined.splitlines()
-                if any(k in l.lower() for k in ("error", "warning", "parse", "syntax"))
-            ]
-            return "\n".join(error_lines) if error_lines else combined
-        return None  # syntax OK
-    except subprocess.TimeoutExpired:
-        return "[syntax check timed out]"
-    except Exception as e:
-        return f"[syntax check failed: {e}]"
-
-
 # ─────────────────────────────────────────────
 # TOOL DISPATCHER
 # ─────────────────────────────────────────────
 
-def _extract_png_from_output(text: str) -> dict | None:
+def _extract_png_from_output(text: str, render_start_time: float | None = None) -> dict | None:
     """
     Find a render preview PNG from bash output and return a tool_read_image payload.
 
-    Strategy 1: token scan for a direct .png path in the output text.
-    Strategy 2: directory fallback — find the previews dir and pick newest PNG.
+    render_start_time:
+        Unix timestamp captured immediately before openscad-render.sh was invoked.
+        Used to filter out stale PNGs from previous iterations. If None, no
+        filtering is applied (legacy behaviour).
+
+    Three strategies, in order:
+
+    1. Token scan — look for any whitespace-separated token ending in .png
+       (handles "Saved to: /path/preview.png" and bare paths).
+       If render_start_time is provided, the file's mtime must be >= it.
+
+    2. Directory fallback — the openscad-render.sh script prints:
+         "Preview images saved in: /home/user/.../previews/"
+       No individual .png token appears, so we glob that directory and
+       pick the file from THIS render based on mtime, not alphabetical order.
+
+    3. Mtime cutoff (defensive) — if all the above fail but a render_start_time
+       is provided, scan common preview locations for any PNG with mtime
+       >= render_start_time.
     """
-    # Strategy 1: token scan
+    cutoff = (render_start_time - RENDER_MTIME_SLACK) if render_start_time else None
+
+    def _accept_mtime(p: str) -> bool:
+        """True if file is fresh enough to be from this render."""
+        if cutoff is None:
+            return True
+        try:
+            return os.path.getmtime(p) >= cutoff
+        except OSError:
+            return False
+
+    # Strategy 1: token scan for a direct .png path
     for raw_line in text.splitlines():
         for token in raw_line.split():
             token_clean = token.rstrip(".,;:")
             if token_clean.endswith(".png"):
                 expanded = os.path.expanduser(token_clean)
-                if os.path.exists(expanded):
+                if os.path.exists(expanded) and _accept_mtime(expanded):
                     result = tool_read_image(expanded)
                     if result["type"] == "image":
                         return result
 
-    # Strategy 2: directory glob — always pick newest file
+    # Strategy 2: directory glob with mtime filtering
+    # Matches lines like: "Preview images saved in: /home/xr23/.../previews/"
     for raw_line in text.splitlines():
         for token in raw_line.split():
             token_clean = token.rstrip(".,;:")
             expanded = os.path.expanduser(token_clean)
             if os.path.isdir(expanded):
                 pngs = glob_module.glob(os.path.join(expanded, "*.png"))
-                if pngs:
-                    isometric = [p for p in pngs if "isometric" in os.path.basename(p)]
-                    chosen = max(isometric, key=os.path.getmtime) if isometric else max(pngs, key=os.path.getmtime)
-                    result = tool_read_image(chosen)
-                    if result["type"] == "image":
-                        print(f"\n  🖼️  [auto-dir] loaded from previews dir: {chosen}")
-                        return result
+                if not pngs:
+                    continue
+
+                # Filter to only PNGs from this render (if we have a snapshot)
+                fresh = [p for p in pngs if _accept_mtime(p)]
+
+                if not fresh:
+                    # The directory exists and has PNGs, but none are fresh.
+                    # This means render produced output elsewhere, or failed silently.
+                    # Don't fall back to stale files — leave for strategy 3.
+                    if cutoff is not None:
+                        print(
+                            f"\n  ⚠️  [auto-dir] {len(pngs)} PNGs in {expanded} but "
+                            f"none modified since render started — skipping"
+                        )
+                    continue
+
+                # Among fresh files, prefer isometric view; otherwise newest.
+                isometric = [p for p in fresh if "isometric" in os.path.basename(p)]
+                chosen = (
+                    max(isometric, key=os.path.getmtime) if isometric
+                    else max(fresh, key=os.path.getmtime)
+                )
+                result = tool_read_image(chosen)
+                if result["type"] == "image":
+                    print(f"\n  🖼️  [auto-dir] loaded from previews dir: {chosen}")
+                    return result
+
+    # Strategy 3: last-resort defensive scan
+    # If we have a render_start_time but neither strategy above found anything,
+    # scan a few common locations for any PNG newer than the snapshot.
+    if cutoff is not None:
+        candidate_globs = [
+            os.path.expanduser("~/openscad-projects/**/previews/*.png"),
+        ]
+        candidates: list[str] = []
+        for pat in candidate_globs:
+            candidates.extend(glob_module.glob(pat, recursive=True))
+
+        fresh = [p for p in candidates if _accept_mtime(p)]
+        if fresh:
+            isometric = [p for p in fresh if "isometric" in os.path.basename(p)]
+            chosen = (
+                max(isometric, key=os.path.getmtime) if isometric
+                else max(fresh, key=os.path.getmtime)
+            )
+            result = tool_read_image(chosen)
+            if result["type"] == "image":
+                print(f"\n  🖼️  [auto-scan] fallback located fresh render: {chosen}")
+                return result
 
     return None
 
@@ -464,8 +521,7 @@ def dispatch_tool(
     name: str,
     args: dict,
     active_project_path: str = "",
-    write_counts: dict = None,       # Fix 3: writes per .scad path since last render
-    bash_repeat_counts: dict = None, # Fix 4: consecutive identical bash commands
+    write_counts: dict = None,          # Fix 3: tracks writes per path since last render
 ) -> tuple[str, dict | None, str, bool, bool]:
     """
     Execute a tool call.
@@ -479,25 +535,9 @@ def dispatch_tool(
     """
     if write_counts is None:
         write_counts = {}
-    if bash_repeat_counts is None:
-        bash_repeat_counts = {}
 
     if name == "bash":
-        command = args.get("command", "").strip()
-
-        # Fix 4: block identical bash commands after BASH_REPEAT_THRESHOLD calls.
-        cmd_key = command.rstrip("/")
-        bash_repeat_counts[cmd_key] = bash_repeat_counts.get(cmd_key, 0) + 1
-        if bash_repeat_counts[cmd_key] >= BASH_REPEAT_THRESHOLD:
-            blocked_msg = (
-                f"[HARNESS] BLOCKED — you have already run this exact command "
-                f"{bash_repeat_counts[cmd_key]} times:\n  {command}\n"
-                "Running it again will not change anything. STOP repeating it.\n"
-                "If the command succeeded, move on to the next step.\n"
-                "If it failed, try a DIFFERENT approach — do not retry the same command."
-            )
-            print(f"\n  🚫 [harness] blocked repeated bash command ({bash_repeat_counts[cmd_key]}x): {command[:80]}")
-            return blocked_msg, None, active_project_path, False, False
+        command = args.get("command", "")
 
         # Block further init calls once a project is active.
         if "openscad-project.sh init" in command and active_project_path:
@@ -510,6 +550,14 @@ def dispatch_tool(
             )
             print(f"\n  🚫 [harness] blocked redundant init — active project: {active_project_path}")
             return forced, None, active_project_path, True, False
+
+        # Fix 4: snapshot the wall-clock time immediately before any render.
+        # We capture it BEFORE tool_bash so any PNG produced by the render
+        # will have mtime >= render_start_time (minus FS resolution slack).
+        render_start_time = None
+        if "openscad-render.sh" in command:
+            render_start_time = time.time()
+            print(f"\n  ⏱️  [harness] render snapshot: {render_start_time:.3f}")
 
         text_result = tool_bash(command, args.get("working_dir"))
 
@@ -525,6 +573,7 @@ def dispatch_tool(
                     if os.path.isdir(expanded) and "openscad-projects" in expanded:
                         project_path = expanded
                         break
+
             text_result += (
                 "\n[HARNESS] SUCCESS — project already exists, no action needed. "
                 f"Project is at: {project_path or '~/openscad-projects/<name>'}. "
@@ -554,21 +603,24 @@ def dispatch_tool(
                 if active_project_path:
                     break
 
-        # Fix 3: render call resets write counters for .scad files.
+        # Fix 3: a render call resets the write counter for any .scad file.
+        # This is the only legitimate reason to keep rewriting — the model
+        # saw a PNG, decided something was wrong, and wants to fix it.
         image_payload = None
         if "openscad-render.sh" in command:
+            # Reset write counts for any .scad files (render = visual feedback received)
             keys_to_reset = [k for k in write_counts if k.endswith(".scad")]
             for k in keys_to_reset:
                 write_counts[k] = 0
             print(f"\n  🔄 [harness] render call — write counters reset for .scad files")
-            print(f"\n  📋 [debug] render output:\n{text_result}\n")
 
-            image_payload = _extract_png_from_output(text_result)
+            # Fix 4: pass render_start_time to filter out stale PNGs.
+            image_payload = _extract_png_from_output(text_result, render_start_time)
             if image_payload:
                 print(f"\n  🖼️  [auto] render preview loaded: {image_payload['path']}")
             else:
                 print(
-                    "\n  ⚠️  [auto] render ran but no .png path found in output "
+                    "\n  ⚠️  [auto] render ran but no fresh .png was located "
                     "— model will not receive a visual this iteration"
                 )
 
@@ -587,26 +639,6 @@ def dispatch_tool(
         path = os.path.expanduser(args.get("path", ""))
         text_result = tool_write_file(path, args["content"])
 
-        # Fix 5: immediate syntax check after writing a .scad file.
-        if path.endswith(".scad"):
-            print(f"\n  🔍 [harness] syntax checking {os.path.basename(path)}...")
-            syntax_error = syntax_check_scad(path)
-            if syntax_error:
-                text_result += (
-                    f"\n[HARNESS] SYNTAX ERROR — the file you just wrote has invalid OpenSCAD syntax:\n"
-                    f"{syntax_error}\n"
-                    "Fix the syntax error NOW. Do NOT call the render script until syntax is valid. "
-                    "Rewrite the file with the error corrected."
-                )
-                print(f"\n  🔴 [harness] syntax error in {os.path.basename(path)}")
-                # Syntax errors don't count toward write escalation —
-                # the model must fix the file, so we reset the counter.
-                write_counts[path] = 0
-                return text_result, None, active_project_path, False, False
-            else:
-                text_result += "\n[HARNESS] Syntax OK — file is valid OpenSCAD."
-                print(f"\n  ✅ [harness] syntax OK: {os.path.basename(path)}")
-
         # Fix 3: track consecutive writes to .scad files without a render.
         needs_write_escalation = False
         if path.endswith(".scad"):
@@ -615,37 +647,24 @@ def dispatch_tool(
             print(f"\n  📊 [harness] write count for {os.path.basename(path)}: {count}")
 
             if count >= WRITE_ESCALATE_THRESHOLD:
+                # Signal the loop to inject a user-role escalation message
                 needs_write_escalation = True
                 print(f"\n  🔴 [harness] write escalation threshold reached ({count} writes) — forcing render")
             elif count >= WRITE_WARN_THRESHOLD:
+                # Softer warning appended to the tool result
                 text_result += (
                     f"\n[HARNESS] WARNING — you have written this file {count} times "
                     "without rendering it. "
-                    "STOP rewriting and call openscad-render.sh preview on this file NOW."
+                    "You are rewriting blindly with no visual feedback. "
+                    "STOP rewriting and call openscad-render.sh preview on this file NOW "
+                    "so you can see what the model looks like before making further changes."
                 )
                 print(f"\n  🟡 [harness] write warning appended ({count} writes without render)")
 
         return text_result, None, active_project_path, False, needs_write_escalation
 
     elif name == "edit_file":
-        path = os.path.expanduser(args.get("path", ""))
-        text_result = tool_edit_file(path, args["old_str"], args["new_str"])
-
-        # Fix 5: syntax check after edit_file on a .scad file too.
-        if path.endswith(".scad") and not text_result.startswith("[ERROR]"):
-            print(f"\n  🔍 [harness] syntax checking {os.path.basename(path)} after edit...")
-            syntax_error = syntax_check_scad(path)
-            if syntax_error:
-                text_result += (
-                    f"\n[HARNESS] SYNTAX ERROR after edit:\n{syntax_error}\n"
-                    "Fix the syntax error before rendering."
-                )
-                print(f"\n  🔴 [harness] syntax error after edit: {os.path.basename(path)}")
-            else:
-                text_result += "\n[HARNESS] Syntax OK after edit."
-                print(f"\n  ✅ [harness] syntax OK after edit: {os.path.basename(path)}")
-
-        return text_result, None, active_project_path, False, False
+        return tool_edit_file(args["path"], args["old_str"], args["new_str"]), None, active_project_path, False, False
 
     elif name == "glob":
         return tool_glob(args["pattern"]), None, active_project_path, False, False
@@ -670,12 +689,17 @@ def load_skill(skill_path: Path) -> str:
 
     raw = skill_file.read_text(encoding="utf-8")
 
+    # Strip YAML frontmatter (--- ... ---)
     if raw.startswith("---"):
         parts = raw.split("---", 2)
-        content = parts[2].strip() if len(parts) >= 3 else raw
+        if len(parts) >= 3:
+            content = parts[2].strip()
+        else:
+            content = raw
     else:
         content = raw
 
+    # Patch skill paths to use actual skill_path
     content = content.replace(
         "~/.claude/skills/openscad/scripts/",
         str(skill_path / "scripts") + "/"
@@ -710,6 +734,7 @@ def run_agent(model: str, skill_path: Path, max_iterations: int = 50) -> None:
     print("═" * 60)
     print("  Type your request. 'quit' or Ctrl-C to exit.\n")
 
+    # ── Outer conversation loop ──────────────────────────────
     while True:
         try:
             user_input = input("You: ").strip()
@@ -732,11 +757,10 @@ def run_agent(model: str, skill_path: Path, max_iterations: int = 50) -> None:
         consecutive_blocked_inits: int = 0
         BLOCKED_INIT_ESCALATION_THRESHOLD = 2
 
-        # Fix 3: write counts per .scad path since last render
+        # Fix 3: tracks how many times each .scad file has been written
+        # since the last render. Resets to 0 when a render call is made.
+        # Key: absolute path, Value: write count since last render.
         write_counts: dict[str, int] = {}
-
-        # Fix 4: consecutive identical bash command counts
-        bash_repeat_counts: dict[str, int] = {}
 
         while iteration < max_iterations:
             iteration += 1
@@ -760,6 +784,7 @@ def run_agent(model: str, skill_path: Path, max_iterations: int = 50) -> None:
                     tools=TOOLS,
                     options={"num_ctx": 32768},
                 )
+
             except ollama.ResponseError as e:
                 print(f"\n[Ollama ERROR] {e}")
                 break
@@ -802,15 +827,18 @@ def run_agent(model: str, skill_path: Path, max_iterations: int = 50) -> None:
                         args = {}
 
                 text_result, image_payload, active_project_path, is_blocked_init, needs_write_escalation = dispatch_tool(
-                    fn, args, active_project_path, write_counts, bash_repeat_counts
+                    fn, args, active_project_path, write_counts
                 )
 
-                messages.append({"role": "tool", "content": text_result})
+                messages.append({
+                    "role": "tool",
+                    "content": text_result
+                })
 
                 if image_payload:
                     pending_images.append(image_payload)
 
-                # Init escalation
+                # Init escalation (existing logic)
                 if is_blocked_init:
                     consecutive_blocked_inits += 1
                     if consecutive_blocked_inits >= BLOCKED_INIT_ESCALATION_THRESHOLD:
@@ -828,7 +856,8 @@ def run_agent(model: str, skill_path: Path, max_iterations: int = 50) -> None:
                 else:
                     consecutive_blocked_inits = 0
 
-                # Fix 3: write loop escalation
+                # Fix 3: write loop escalation — inject a user-role message
+                # forcing the model to render instead of rewriting again.
                 if needs_write_escalation:
                     scad_path = os.path.expanduser(args.get("path", ""))
                     escalation = (
